@@ -6,6 +6,7 @@ Alt + 鼠标左键 点击聊天记录即可选择加入文件夹，一个聊天�
 如果给本项目点个Star⭐，感激涕零
 
 页面展示：
+
 <img width="309" height="524" alt="image" src="https://github.com/user-attachments/assets/2fc885c7-01ba-4248-a400-8e615d5726ef" />
 
 
