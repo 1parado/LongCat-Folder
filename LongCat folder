@@ -1,0 +1,346 @@
+// ==UserScript==
+// @name         Longcat Folder (Sync Fix)
+// @namespace    https://tampermonkey.net/
+// @version      2.8.1
+// @description  LongCat folder
+// @author       Paradox
+// @match        https://longcat.chat/*
+// @match        https://www.longcat.chat/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SELECTORS = {
+    listRoot: '.conversation-list',
+    listInner: '.conversation-list .time-list',
+    chatItem: '.conversation-list .time-list > div',
+  };
+
+  const STORE_KEY = 'longcat_folder_system_v1';
+  let store = loadStore();
+  let searchQuery = "";
+
+  function loadStore() {
+    const s = GM_getValue(STORE_KEY, null);
+    if (s && typeof s === 'object' && Array.isArray(s.folders)) return s;
+    return { folders: [], chatMeta: {} };
+  }
+
+  function saveStore() {
+    GM_setValue(STORE_KEY, store);
+  }
+
+  function hash(text) {
+    let h = 0;
+    for (let i = 0; i < text.length; i++) { h = (h << 5) - h + text.charCodeAt(i); h |= 0; }
+    return String(Math.abs(h));
+  }
+
+
+  function getStableChatId(el) {
+    if (!el) return null;
+
+
+    const link = el.querySelector('a[href]');
+    if (link) {
+        const href = link.getAttribute('href');
+
+        return 'id_' + hash(href);
+    }
+
+
+    const internalId = el.getAttribute('data-id') || el.id;
+    if (internalId) return 'raw_' + hash(internalId);
+    return 't_' + hash(el.innerText.trim());
+  }
+
+  function syncVisibleTitles(foundIdsSet = null) {
+    const items = document.querySelectorAll(SELECTORS.chatItem);
+    let updated = false;
+    items.forEach(el => {
+      const cid = getStableChatId(el);
+
+      const title = el.innerText.split('\n')[0].trim();
+
+      if (cid && title) {
+        if (foundIdsSet) foundIdsSet.add(cid);
+
+
+        if (!store.chatMeta[cid] || store.chatMeta[cid].title !== title) {
+          store.chatMeta[cid] = { title, lastSeen: Date.now() };
+          updated = true;
+        }
+      }
+    });
+    if (updated) saveStore();
+    return updated;
+  }
+
+  async function performDeepSync(btn) {
+    const scrollContainer = document.querySelector(SELECTORS.listRoot);
+    if (!scrollContainer) return;
+
+    const originalText = btn.innerText;
+    btn.innerText = "⌛ Syncing...";
+    btn.style.opacity = "0.5";
+    btn.disabled = true;
+
+
+    scrollContainer.scrollTop = 0;
+    await new Promise(r => setTimeout(r, 300));
+
+    let lastScrollTop = -1;
+    let retriesAtBottom = 0;
+    const allSeenIds = new Set();
+
+    while (retriesAtBottom < 3) {
+        syncVisibleTitles(allSeenIds);
+
+        if (scrollContainer.scrollTop === lastScrollTop) {
+            retriesAtBottom++;
+        } else {
+            retriesAtBottom = 0;
+        }
+
+        lastScrollTop = scrollContainer.scrollTop;
+        scrollContainer.scrollTop += 900;
+        await new Promise(r => setTimeout(r, 450));
+    }
+
+
+    let removedCount = 0;
+    store.folders.forEach(f => {
+        const originalLength = f.chatIds.length;
+
+        f.chatIds = f.chatIds.filter(cid => allSeenIds.has(cid));
+        removedCount += (originalLength - f.chatIds.length);
+    });
+
+    saveStore();
+    renderFolders();
+
+    btn.innerText = originalText;
+    btn.style.opacity = "1";
+    btn.disabled = false;
+
+    alert(`Sync Complete！\n- Scanned ${allSeenIds.size} sessions\n- Updated renamed titles\n- Removed ${removedCount} dead links`);
+  }
+
+  // ... (renderFolders, ensurePanel, findAndClickChat, handlePanelClick, removeIdFromAllFolders 保持不变)
+  function renderFolders() {
+    if (!ensurePanel()) return;
+    const wrap = panelEl.querySelector('.lcfs-folders');
+
+    const filteredFolders = store.folders.map(f => {
+      const matchedChats = f.chatIds.filter(cid => {
+        const title = (store.chatMeta[cid]?.title || 'Unknown Session').toLowerCase();
+        return title.includes(searchQuery);
+      });
+      const folderNameMatches = f.name.toLowerCase().includes(searchQuery);
+      return { ...f, matchedChats, folderNameMatches };
+    }).filter(f => f.folderNameMatches || f.matchedChats.length > 0);
+
+    wrap.innerHTML = filteredFolders.map(f => `
+      <div class="lcfs-folder" data-fid="${f.id}">
+        <div class="lcfs-folder-head">
+          <span class="lcfs-arrow">${f.collapsed ? '▸' : '▾'}</span>
+          <span class="lcfs-folder-name">${f.name}</span>
+          <span class="lcfs-badge">${f.chatIds.length}</span>
+          <div class="lcfs-f-ops"><button data-act="ren">✏️</button><button data-act="del">🗑️</button></div>
+        </div>
+        <div class="lcfs-folder-body ${(f.collapsed && !searchQuery) ? 'hidden' : ''}">
+          ${f.matchedChats.map(cid => `
+            <div class="lcfs-chat" data-cid="${cid}">
+              <span class="lcfs-chat-title">${store.chatMeta[cid]?.title || '<i style="color:#999">wait sync...</i>'}</span>
+              <button class="lcfs-rm-btn" data-act="rm">✕</button>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `).join('') || `<div class="lcfs-empty">Nothing to Display</div>`;
+  }
+
+  let panelEl = null;
+  function ensurePanel() {
+    const root = document.querySelector(SELECTORS.listRoot);
+    if (!root || (panelEl && document.body.contains(panelEl))) return !!panelEl;
+    panelEl = document.createElement('div');
+    panelEl.className = 'lcfs-panel';
+    panelEl.innerHTML = `
+      <div class="lcfs-panel-header">
+        <div class="lcfs-title">LongCat Folder</div>
+        <div style="display:flex; gap:8px">
+            <button class="lcfs-sync-btn" title="Deep Sync">🔄Deep Sync</button>
+            <button class="lcfs-add-btn" data-act="add">New</button>
+        </div>
+      </div>
+      <div class="lcfs-search-wrap">
+        <input type="text" class="lcfs-search-input" placeholder="Search...">
+      </div>
+      <div class="lcfs-folders"></div>
+    `;
+    root.prepend(panelEl);
+
+    panelEl.querySelector('.lcfs-search-input').oninput = (e) => {
+      searchQuery = e.target.value.toLowerCase();
+      renderFolders();
+    };
+
+    panelEl.querySelector('.lcfs-sync-btn').onclick = (e) => {
+        performDeepSync(e.target);
+    };
+
+    panelEl.addEventListener('pointerdown', handlePanelClick, true);
+    return true;
+  }
+
+  async function findAndClickChat(targetCid) {
+    const scrollContainer = document.querySelector(SELECTORS.listRoot);
+    if (!scrollContainer) return false;
+
+    let lastScrollTop = -1;
+    let retriesAtBottom = 0;
+
+    while (true) {
+        const items = document.querySelectorAll(SELECTORS.chatItem);
+        let foundEl = null;
+        for (const el of items) {
+            if (getStableChatId(el) === targetCid) {
+                foundEl = el;
+                break;
+            }
+        }
+
+        if (foundEl) {
+            foundEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            setTimeout(() => { (foundEl.querySelector('a') || foundEl).click(); }, 200);
+            return { status: 'found' };
+        }
+
+        if (scrollContainer.scrollTop === lastScrollTop) {
+            retriesAtBottom++;
+            if (retriesAtBottom >= 3) return { status: 'not_found_at_bottom' };
+        } else {
+            retriesAtBottom = 0;
+        }
+
+        lastScrollTop = scrollContainer.scrollTop;
+        scrollContainer.scrollTop = scrollContainer.scrollHeight;
+        await new Promise(r => setTimeout(r, 600));
+        syncVisibleTitles();
+    }
+  }
+
+  function handlePanelClick(e) {
+    const btn = e.target.closest('button[data-act], .lcfs-chat, .lcfs-folder-head');
+    if (!btn) return;
+    e.preventDefault(); e.stopPropagation();
+    const fid = btn.closest('.lcfs-folder')?.dataset.fid;
+    const act = btn.dataset.act;
+
+    if (act === 'add') {
+      const n = prompt('Folder name:');
+      if (n) { store.folders.unshift({id:'f'+Date.now(), name:n, collapsed:false, chatIds:[]}); saveStore(); renderFolders(); }
+    } else if (btn.classList.contains('lcfs-folder-head')) {
+      const f = store.folders.find(x => x.id === fid);
+      f.collapsed = !f.collapsed; saveStore(); renderFolders();
+    } else if (btn.classList.contains('lcfs-chat')) {
+      const cid = btn.dataset.cid;
+      findAndClickChat(cid).then(result => {
+          if (result.status === 'not_found_at_bottom') {
+              if (confirm('Session Timeout，Is remove?')) removeIdFromAllFolders(cid);
+          }
+      });
+    } else if (act === 'rm') {
+      removeIdFromAllFolders(btn.closest('.lcfs-chat').dataset.cid, fid);
+    } else if (act === 'ren') {
+      const f = store.folders.find(x => x.id === fid);
+      const n = prompt('Rename folder:', f.name);
+      if (n) { f.name = n; saveStore(); renderFolders(); }
+    } else if (act === 'del') {
+      if (confirm('Delete folder?')) { store.folders = store.folders.filter(x => x.id !== fid); saveStore(); renderFolders(); }
+    }
+  }
+
+  function removeIdFromAllFolders(cid, specificFid = null) {
+      store.folders.forEach(f => {
+          if (!specificFid || f.id === specificFid) f.chatIds = f.chatIds.filter(x => x !== cid);
+      });
+      saveStore(); renderFolders();
+  }
+
+  GM_addStyle(`
+    .lcfs-panel { margin: 12px; border-radius: 16px; background: rgba(255, 255, 255, 0.7); border: 1px solid rgba(255,255,255,0.5); backdrop-filter: blur(20px); color: #333; overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.08); font-family: sans-serif; }
+    .lcfs-panel-header { padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; }
+    .lcfs-title { font-weight: bold; font-size: 14px; opacity: 0.8; }
+    .lcfs-sync-btn { background: rgba(16, 163, 127, 0.1); border: 1px solid rgba(16, 163, 127, 0.2); color: #10a37f; cursor: pointer; font-size: 11px; padding: 5px 10px; border-radius: 6px; transition: 0.2s; font-weight: bold; }
+    .lcfs-sync-btn:hover { background: rgba(16, 163, 127, 0.2); }
+    .lcfs-add-btn { background: #10a37f; color: white; border: none; padding: 4px 12px; border-radius: 20px; font-size: 11px; cursor: pointer; }
+    .lcfs-search-wrap { padding: 0 16px 10px; }
+    .lcfs-search-input { width: 100%; padding: 6px 12px; border-radius: 10px; border: 1px solid rgba(0,0,0,0.05); background: rgba(255,255,255,0.5); font-size: 12px; outline: none; }
+    .lcfs-folders { padding: 0 8px 12px; max-height: 400px; overflow-y: auto; }
+    .lcfs-folder { margin-top: 6px; border-radius: 12px; background: rgba(0,0,0,0.02); }
+    .lcfs-folder-head { padding: 8px 12px; display: flex; align-items: center; cursor: pointer; gap: 8px; }
+    .lcfs-folder-name { flex: 1; font-size: 13px; font-weight: 500; }
+    .lcfs-badge { font-size: 10px; opacity: 0.4; }
+    .lcfs-folder-body { padding: 2px 6px 6px; }
+    .lcfs-folder-body.hidden { display: none; }
+    .lcfs-chat { display: flex; align-items: center; padding: 6px 10px; border-radius: 8px; cursor: pointer; transition: 0.2s; }
+    .lcfs-chat:hover { background: rgba(255,255,255,0.9); }
+    .lcfs-chat-title { flex: 1; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .lcfs-rm-btn { opacity: 0; background: none; border: none; color: #ff4d4f; cursor: pointer; font-size: 10px; }
+    .lcfs-chat:hover .lcfs-rm-btn { opacity: 1; }
+    .lcfs-f-ops { display: flex; gap: 4px; opacity: 0; }
+    .lcfs-folder-head:hover .lcfs-f-ops { opacity: 0.5; }
+    .lcfs-f-ops button { background:none; border:none; cursor:pointer; font-size:11px; }
+    .lcfs-modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.1); backdrop-filter:blur(4px); z-index:20000; display:flex; align-items:center; justify-content:center; }
+  `);
+
+  function boot() {
+    if (ensurePanel()) {
+      syncVisibleTitles();
+      renderFolders();
+    }
+  }
+
+  document.addEventListener('scroll', (e) => {
+      if (e.target.closest && e.target.closest(SELECTORS.listRoot)) syncVisibleTitles();
+  }, true);
+
+  const t = setInterval(() => {
+    if (document.querySelector(SELECTORS.listRoot)) { clearInterval(t); boot(); }
+  }, 500);
+
+  document.addEventListener('pointerdown', (e) => {
+    if (!e.altKey) return;
+    const item = e.target.closest(SELECTORS.chatItem);
+    if (!item) return;
+    e.preventDefault(); e.stopPropagation();
+    syncVisibleTitles();
+    const cid = getStableChatId(item);
+    const overlay = document.createElement('div');
+    overlay.className = 'lcfs-modal-overlay';
+    overlay.innerHTML = `<div style="background:white; padding:20px; border-radius:20px; width:260px; box-shadow:0 10px 40px rgba(0,0,0,0.1)">
+      <div style="font-weight:bold; margin-bottom:15px; text-align:center">Add to Folder</div>
+      <div style="max-height:200px; overflow:auto">
+        ${store.folders.map(f => `<label style="display:flex; align-items:center; gap:8px; padding:8px; border-bottom:1px solid #f9f9f9; cursor:pointer; font-size:13px"><input type="checkbox" data-fid="${f.id}" ${f.chatIds.includes(cid)?'checked':''}>${f.name}</label>`).join('')}
+      </div>
+      <button id="lcfs-save" style="width:100%; background:#10a37f; color:white; border:none; padding:10px; border-radius:12px; margin-top:15px; cursor:pointer">Finish</button>
+    </div>`;
+    document.body.appendChild(overlay);
+    overlay.onclick = (ev) => { if(ev.target === overlay) overlay.remove(); };
+    overlay.querySelector('#lcfs-save').onclick = () => {
+      overlay.querySelectorAll('input').forEach(i => {
+        const f = store.folders.find(x => x.id === i.dataset.fid);
+        if (i.checked && !f.chatIds.includes(cid)) f.chatIds.unshift(cid);
+        else if (!i.checked && f.chatIds.includes(cid)) f.chatIds = f.chatIds.filter(x => x !== cid);
+      });
+      saveStore(); renderFolders(); overlay.remove();
+    };
+  }, true);
+
+})();
